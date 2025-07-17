@@ -1,0 +1,522 @@
+CREATE DATABASE IF NOT EXISTS lojaRoupas;
+
+USE lojaRoupas;
+
+CREATE TABLE IF NOT EXISTS Customer (
+    idCustomer INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    cpf VARCHAR(11) UNIQUE NOT NULL,
+    address VARCHAR(100) NOT NULL DEFAULT 'NOT GIVEN',
+    phoneNumber VARCHAR(20),
+    email VARCHAR(50) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS Category(
+	idCategory INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL UNIQUE,
+    description TEXT
+);
+
+CREATE TABLE IF NOT EXISTS Product(
+	idProduct INT AUTO_INCREMENT PRIMARY KEY,
+    price DECIMAL(10,2) NOT NULL CHECK(price>=0),
+    name VARCHAR(50) NOT NULL,
+    brand VARCHAR(50) NOT NULL,
+    description TEXT,
+    idCategory INT NOT NULL,
+    FOREIGN KEY (idCategory) REFERENCES Category(idCategory)
+);
+
+CREATE TABLE IF NOT EXISTS Product_Inventory(
+	idProductInventory INT AUTO_INCREMENT PRIMARY KEY,
+    idProduct INT NOT NULL,
+    size VARCHAR(10),
+    color VARCHAR(100),
+    stockQuantity INT NOT NULL DEFAULT 0 CHECK(stockQuantity >= 0) ,
+    observations TEXT,
+    lastUpdate DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (idProduct) REFERENCES Product(idProduct),
+    UNIQUE (idProduct,size,color)
+);
+
+CREATE TABLE IF NOT EXISTS Orders(
+	idOrders INT AUTO_INCREMENT PRIMARY KEY,
+    idCustomer INT NOT NULL,
+    orderDate DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status VARCHAR(12) NOT NULL CHECK(status IN ('Pending','Completed','Cancelled','Shipped')),
+    FOREIGN KEY (idCustomer) REFERENCES Customer(idCustomer)
+);
+
+CREATE TABLE IF NOT EXISTS Orders_Items(
+	idOrdersItems INT AUTO_INCREMENT PRIMARY KEY,
+    idOrders INT NOT NULL,
+    idProductInventory INT NOT NULL,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    unitPrice DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (idOrders) REFERENCES Orders(idOrders),
+    FOREIGN KEY (idProductInventory) REFERENCES Product_Inventory(idProductInventory)
+);
+
+CREATE TABLE IF NOT EXISTS Payment (
+    idPayment INT AUTO_INCREMENT PRIMARY KEY,
+    idOrders INT NOT NULL,
+    idCustomer INT NOT NULL,
+    paymentDate DATETIME DEFAULT CURRENT_TIMESTAMP,
+    amount DECIMAL(10 , 2 ),
+    transactionID VARCHAR(50) UNIQUE,
+    paymentMethod VARCHAR(50) NOT NULL CHECK (paymentMethod IN ('Credit Card' , 'PIX', 'Debit Card')),
+    status VARCHAR(20) NOT NULL CHECK (status IN ('Completed' , 'Pending',
+        'Failed',
+        'Refunded',
+        'Cancelled')),
+    FOREIGN KEY (idOrders)
+        REFERENCES Orders (idOrders),
+    FOREIGN KEY (idCustomer)
+        REFERENCES Customer (idCustomer)
+);
+
+USE lojaroupas;
+DROP VIEW IF EXISTS Category_Summary; 
+CREATE VIEW Category_Summary AS -- show a summary of the the categories and how many unique products and total stock quantity does it have
+SELECT 
+C.name as CategoryName,
+COUNT(DISTINCT P.idProduct) AS NumberUniqueProducts,
+SUM(PI.stockQuantity) AS TotalStockQuantityInCategory
+FROM Category as C
+LEFT JOIN 
+Product AS P ON C.idCategory = P.idCategory
+LEFT JOIN 
+Product_Inventory AS PI ON P.idProduct = PI.idProduct
+GROUP BY
+C.idCategory, C.name;
+
+DROP VIEW IF EXISTS AvailableProductsColor;
+CREATE VIEW AvailableProductsColor AS
+    SELECT 
+        P.name AS ProductName,
+        P.brand,
+        C.name AS CategoryName,
+        PI.color AS ProductColor,
+        SUM(PI.stockQuantity) AS TotalStockForColor
+    FROM
+        Product AS P
+            LEFT JOIN
+        Category AS C ON P.idCategory = C.idCategory
+            INNER JOIN
+        Product_Inventory AS PI ON P.idProduct = PI.idProduct
+    WHERE
+        PI.stockQuantity > 0
+    GROUP BY P.idProduct , P.name , P.brand , C.name , PI.color
+    ORDER BY P.name , PI.color;
+    
+DROP VIEW IF EXISTS AllProducts;
+CREATE VIEW AllProducts AS
+    SELECT 
+        P.Name AS ProductName,
+        C.name AS CategoryName,
+        P.brand,
+        SUM(PI.stockQuantity) AS TotalStock
+    FROM
+        Product AS P
+            LEFT JOIN
+        Category AS C ON P.idCategory = C.idCategory
+            INNER JOIN
+        Product_Inventory AS PI ON P.idProduct = PI.idProduct
+    GROUP BY P.idProduct , P.name , P.brand , C.name
+    ORDER BY P.name;
+
+DROP PROCEDURE IF EXISTS AddProduct;
+DELIMITER //
+CREATE PROCEDURE AddProduct( -- create a procedure to easily add new products
+   IN p_price DECIMAL(10,2),
+   IN p_name VARCHAR(50),
+   IN p_brand VARCHAR(50),
+   IN p_description TEXT,
+   IN p_idCategory INT,
+   IN pi_size VARCHAR(10),
+   IN pi_color VARCHAR(100),
+   IN pi_stockQuantity INT,
+   IN pi_observations TEXT
+   )BEGIN 
+   DECLARE new_productID INT;
+   DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Error: Failed to add product or initial variant. Transaction rolled back.';
+    END;
+    START TRANSACTION;
+    INSERT INTO Product(price,name,brand,description,idCategory)
+    VALUES (p_price,p_name,p_brand,p_description,p_idCategory);
+    SET new_productID = last_insert_id();
+    IF pi_size IS NOT NULL THEN
+       INSERT INTO Product_Inventory(idProduct, size, color, stockQuantity, observations)
+       VALUES (new_productID, pi_size, pi_color, COALESCE(pi_stockQuantity,0), pi_observations);
+  END IF;
+    COMMIT;
+   END // 
+DELIMITER ; 
+
+DROP VIEW IF EXISTS orders_summary;
+CREATE VIEW orders_summary AS
+    SELECT 
+        O.idOrders,
+        O.idCustomer,
+        C.name AS CustomerName,
+        O.orderDate,
+        O.status,
+        GET_TOTAL_ORDER(O.idOrders) AS TotalAmount
+    FROM
+        Orders AS O
+            INNER JOIN
+        Customer AS C ON O.idCustomer = C.idCustomer;
+
+USE lojaroupas;
+DROP TRIGGER IF EXISTS WarningFinishingStock;
+DELIMITER //
+CREATE TRIGGER WarningFinishingStock
+	BEFORE UPDATE ON Product_Inventory
+    FOR EACH ROW 
+    BEGIN
+    IF NEW.stockQuantity<3 THEN
+		SIGNAL SQLSTATE '01000'
+		SET MESSAGE_TEXT = 'Warning: Low Stock of this Product! Less then 3 units';
+	END IF;
+END //
+DELIMITER 
+DROP TRIGGER IF EXISTS PixDiscount;
+DELIMITER //
+CREATE TRIGGER PixDiscount
+BEFORE INSERT ON Payment
+FOR EACH ROW
+BEGIN
+DECLARE original_total DECIMAL(10,2);
+IF NEW.paymentMethod = 'PIX' THEN
+SET NEW.amount = compute_discount(original_total,10);
+END IF ;
+END //
+DELIMITER ;
+
+USE lojaroupas;
+DROP FUNCTION IF EXISTS compute_discount;
+DELIMITER //
+CREATE FUNCTION compute_discount(
+ price DECIMAL(10,2),
+ percentage INT
+ )
+ RETURNS DECIMAL(10,2)
+ BEGIN 
+ DECLARE final_price DECIMAL(10,2);
+ SET final_price = price - (price * percentage/100);
+ RETURN final_price;
+ END //
+ DELIMITER ;
+DROP FUNCTION IF EXISTS get_total_order; 
+ DELIMITER //
+ 
+ CREATE FUNCTION get_total_order(p_idOrder INT)
+ RETURNS DECIMAL(10,2)
+ DETERMINISTIC -- Important: tells MySQL the function returns the same result for the same inputs
+ BEGIN 
+ DECLARE total DECIMAL(10,2);
+SELECT 
+    SUM(quantity * unitPrice)
+INTO total FROM
+    Orders_Items
+WHERE
+    idOrders = p_idOrder;
+ RETURN COALESCE(total,0.00);
+ END //
+ DELIMITER ;
+
+USE lojaroupas;
+-- Inserts for Category Table
+INSERT INTO Category (name, description) VALUES
+('Camisetas', 'Camisetas masculinas e femininas de diversos estilos.'),
+('Calças', 'Calças jeans, sociais, esportivas e outras.'),
+('Vestidos', 'Vestidos para todas as ocasiões, curtos e longos.'),
+('Acessórios', 'Cintos, bolsas, joias e outros complementos.'),
+('Calçados', 'Sapatos, tênis, sandálias e botas.');
+
+-- Inserts for Customer Table
+INSERT INTO Customer (name, cpf, address, phoneNumber, email) VALUES
+('Ana Clara Silva', '11122233344', 'Rua das Flores, 123, Centro', '31987654321', 'ana.clara@email.com'),
+('Bruno Eduardo Costa', '22233344455', 'Av. Principal, 45, Bairro Novo', '31998765432', 'bruno.eduardo@email.com'),
+('Carla Dias Pereira', '33344455566', 'Travessa da Paz, 78, Vila Boa', '31976543210', 'carla.dias@email.com'),
+('Daniel Felipe Souza', '44455566677', 'Alameda dos Sonhos, 90, Eldorado', '31965432109', 'daniel.felipe@email.com'),
+('Eloisa Martins Lima', '55566677788', 'Praça da Liberdade, 10, Centro', '31954321098', 'eloisa.lima@email.com');
+
+-- Inserts for Product Table
+INSERT INTO Product (price, name, brand, description, idCategory) VALUES
+(79.90, 'Camiseta Básica Algodão', 'Marca Conforto', 'Camiseta unissex de algodão 100%, diversas cores.', 1),
+(129.50, 'Calça Jeans Slim Fit', 'Denim Style', 'Jeans moderno com corte ajustado, azul escuro.', 2),
+(189.00, 'Vestido Florido Verão', 'Primavera Fashion', 'Vestido leve com estampa floral, ideal para o verão.', 3),
+(45.00, 'Cinto de Couro Clássico', 'Couro Legítimo', 'Cinto masculino de couro marrom, fivela discreta.', 4),
+(250.00, 'Tênis Esportivo Pro', 'SpeedRun', 'Tênis com amortecimento avançado para corrida e treino.', 5),
+(89.90, 'Camiseta Polo Piquet', 'Estilo Casual', 'Camisa polo clássica em tecido piquet, masculina.', 1),
+(150.00, 'Calça Social Feminina', 'Elegance Wear', 'Calça de tecido fino, corte reto, preta, feminina.', 2);
+
+-- Inserts for Product_Inventory Table
+INSERT INTO Product_Inventory (idProduct, size, color, stockQuantity, observations) VALUES
+(1, 'M', 'Branco', 50, 'Estoque inicial de camiseta branca M.'),
+(1, 'G', 'Preto', 40, 'Estoque inicial de camiseta preta G.'),
+(2, '40', 'Azul Escuro', 30, 'Estoque inicial de calça jeans azul 40.'),
+(2, '42', 'Azul Escuro', 25, 'Estoque inicial de calça jeans azul 42.'),
+(3, 'P', 'Floral Azul', 15, 'Estoque inicial de vestido floral P.'),
+(3, 'M', 'Floral Rosa', 10, 'Estoque inicial de vestido floral M.'),
+(4, 'Único', 'Marrom', 60, 'Cinto padrão.'),
+(5, '41', 'Preto/Branco', 20, 'Tênis de corrida.'),
+(5, '42', 'Cinza/Verde', 18, 'Tênis de treino.'),
+(6, 'M', 'Azul Marinho', 35, 'Polo masculina M.'),
+(7, '38', 'Preto', 20, 'Calça social 38.');
+
+-- Inserts for Orders Table (Corrected version without totalAmount)
+INSERT INTO Orders (idCustomer, orderDate, status) VALUES
+(1, '2025-06-10 10:00:00', 'Completed'),
+(2, '2025-06-11 14:30:00', 'Pending'),
+(1, '2025-06-12 09:15:00', 'Shipped'),
+(3, '2025-06-13 16:00:00', 'Completed');
+
+-- Inserts for Orders_Items Table
+INSERT INTO Orders_Items (idOrders, idProductInventory, quantity, unitPrice) VALUES
+(1, 3, 1, 129.50),
+(1, 1, 1, 79.90),
+(1, 7, 1, 45.00),
+(2, 5, 1, 189.00),
+(3, 8, 1, 250.00),
+(4, 10, 1, 89.90);
+
+-- Inserts for Payment Table
+INSERT INTO Payment (idOrders, idCustomer, paymentDate, amount, transactionID, paymentMethod, status) VALUES
+(1, 1, '2025-06-10 10:05:00', 254.40, 'TRX1234567890', 'Credit Card', 'Completed'),
+(2, 2, '2025-06-11 14:35:00', 189.00, 'TRX0987654321', 'PIX', 'Pending'),
+(3, 1, '2025-06-12 09:20:00', 250.00, 'TRX5678901234', 'Debit Card', 'Completed'),
+(4, 3, '2025-06-13 16:05:00', 89.90, 'TRX9012345678', 'Credit Card', 'Completed');
+
+-- Add Product Using the Procedure AddProduct
+CALL AddProduct(75.00, 'Mochila Pequena', 'TravelLite', 'Mochila compacta para uso diário.', 4, NULL, NULL, NULL, NULL);
+CALL AddProduct(220.00, 'Calça Chino Confort', 'Urbano Wear', 'Calça chino confortável para o dia a dia.', 2, '42', 'Azul Marinho', 25, 'Ideal para looks casuais e semi-formais.');
+CALL AddProduct(119.90, 'Camiseta Estampada', 'Trendy Tees', 'Camiseta de algodão com estampa gráfica moderna.', 1, 'P', 'Verde', 40, 'Nova coleção Verão 2025.');
+
+-- =================================================================================
+-- UPDATE AND DELETE EXAMPLES FOR DEMONSTRATION
+-- =================================================================================
+
+-- --- UPDATE Example 1: Change a customer's address ---
+UPDATE Customer SET address = 'Rua Nova, 500, Novo Bairro', phoneNumber = '31912345678' WHERE idCustomer = 1;
+-- To verify: SELECT address, phoneNumber FROM Customer WHERE idCustomer = 1;
+
+-- --- UPDATE Example 2: Change an order's status ---
+-- Goal: Update Order #2 from 'Pending' to 'Shipped'.
+UPDATE Orders SET status = 'Shipped' WHERE idOrders = 2;
+-- To verify: SELECT status FROM Orders WHERE idOrders = 2;
+
+-- --- UPDATE Example 3: Increase prices for a whole category ---
+-- Goal: Give a 10% price increase to all 'Camisetas'.
+UPDATE Product SET price = price * 1.10 WHERE idCategory = (SELECT idCategory FROM Category WHERE name = 'Camisetas');
+-- To verify: SELECT name, price FROM Product WHERE idCategory = 1;
+
+-- --- UPDATE Example 4: Add new inventory stock ---
+-- Goal: Add 20 more units of the white, size 'M' T-shirt (idProductInventory = 1).
+UPDATE Product_Inventory SET stockQuantity = stockQuantity + 20 WHERE idProductInventory = 1;
+-- To verify: SELECT stockQuantity FROM Product_Inventory WHERE idProductInventory = 1;
+
+
+-- --- DELETE Example 1: A "Safe" Delete ---
+-- Goal: Delete an unused inventory item that is not part of any order.
+DELETE FROM Product_Inventory WHERE idProductInventory = 11;
+-- To verify: SELECT * FROM Product_Inventory WHERE idProductInventory = 11; -- (should be empty)
+
+-- --- DELETE Example 2: A Multi-Step "Safe" Delete ---
+-- Goal: A customer cancels Order #4. We must delete the order items first, then the order itself.
+-- Step A: Delete items from the junction table.
+DELETE FROM Orders_Items WHERE idOrders = 4;
+-- Step B: Delete the parent order record.
+DELETE FROM Orders WHERE idOrders = 4;
+-- To verify: SELECT * FROM Orders WHERE idOrders = 4; -- (should be empty)
+
+-- --- DELETE Example 3: A "Failing" Delete to show Data Integrity ---
+-- Goal: Show that the database prevents us from deleting a customer with existing orders.
+-- This query will produce a foreign key constraint error, which is the CORRECT behavior.
+-- DELETE FROM Customer WHERE idCustomer = 1;
+
+USE lojaroupas;
+
+-- Goal: Retrieve a list of all orders, showing key order details along with the name and email of the customer who made each purchase.
+-- This uses an INNER JOIN, so it will only show orders that have a matching customer.
+SELECT 
+    O.idOrders,
+    O.orderDate,
+    o.status,
+    C.name AS CustomerName,
+    C.email AS CustomerEmail
+FROM
+    orders AS O
+        INNER JOIN
+    Customer AS C ON o.idCustomer = C.idCustomer;
+
+
+-- Goal: Display a comprehensive list of all products, including their brand, price, and category.
+-- It also shows every available inventory variation (size, color, and stock quantity) for each product.
+-- This uses LEFT JOINs from Product, so it will show all products, even if they don't have inventory yet.
+SELECT
+    P.name AS ProductName,
+    P.brand,
+    P.price,
+    C.name AS CategoryName,
+    PI.size,
+    PI.stockQuantity,
+    PI.lastUpdate,
+    PI.color
+FROM 
+    Product as P
+        LEFT JOIN 
+    Category AS C ON P.idCategory = C.idCategory
+        LEFT JOIN 
+    Product_Inventory AS PI ON PI.idProduct = P.idProduct;
+
+
+-- Goal: List every customer in the database, and next to each one, show the details of any orders they have placed.
+-- This uses a RIGHT JOIN to ensure that all customers are listed, even those who have never made a purchase.
+-- For customers without orders, the order-related fields will be NULL.
+SELECT 
+    C.name,
+    C.email,
+    O.idOrders,
+    O.orderDate,
+    O.status
+FROM
+    Orders as O
+        RIGHT JOIN
+    Customer AS C ON C.idCustomer = O.idCustomer;
+
+
+-- Goal: Show every specific item variant currently in the inventory (each size and color combination),
+-- and for each one, display its general product name, brand, and category.
+-- This uses a RIGHT JOIN to focus on the inventory, ensuring every stocked item is shown.
+SELECT 
+    C.name,
+    P.name,
+    P.brand,
+    PI.size,
+    PI.stockQuantity
+FROM
+    Product AS P
+        LEFT JOIN
+    Category AS C ON C.idCategory = P.idCategory
+        RIGHT JOIN
+    Product_Inventory AS PI ON P.idProduct = PI.idProduct;
+
+
+-- =================================================================================
+-- FINAL TEST SCRIPT FOR LOJA DE ROUPAS DATABASE
+-- =================================================================================
+
+USE lojaRoupas;
+
+
+-- =================================================================================
+-- ## 1. TESTING VIEWS ##
+-- =================================================================================
+
+-- --- Test 1.1: Show a summary of all orders using the 'orders_summary' view ---
+-- This view simplifies querying by showing the calculated total amount for each order automatically.
+SELECT * FROM orders_summary;
+
+
+-- --- Test 1.2: Show a high-level summary of all categories ---
+-- This view shows how many unique products and the total stock quantity for each category.
+SELECT * FROM Category_Summary;
+
+
+-- --- Test 1.3: Find all available products that are blue ---
+-- This shows how a view can be filtered with a WHERE clause just like a regular table.
+SELECT ProductName, brand, ProductColor, TotalStockForColor
+FROM AvailableProductsColor
+WHERE ProductColor LIKE '%Azul%';
+
+
+-- =================================================================================
+-- ## 2. TESTING THE STORED PROCEDURE (AddProduct) ##
+-- =================================================================================
+
+-- --- Test 2.1: Add a new "Winter Coat" product ---
+-- This single command safely adds the product and its inventory in one transaction.
+CALL AddProduct(
+    350.00,                     -- price
+    'Casaco de Inverno',        -- name
+    'Marca Frio Zero',          -- brand
+    'Casaco de lã forrado para o inverno.', -- description
+    1,                          -- idCategory (Camisetas, could be a new category)
+    'G',                        -- size
+    'Cinza Escuro',             -- color
+    20,                         -- stockQuantity
+    'Coleção de inverno.'       -- observations
+);
+
+
+-- --- Test 2.2: Verify that the new coat was added correctly ---
+-- Check the Product table for the new product
+SELECT * FROM Product WHERE name = 'Casaco de Inverno';
+
+-- Check the Product_Inventory table for its specific stock entry
+SELECT * FROM Product_Inventory WHERE idProduct = (SELECT idProduct FROM Product WHERE name = 'Casaco de Inverno');
+
+
+-- =================================================================================
+-- ## 3. TESTING FUNCTIONS ##
+-- =================================================================================
+
+-- --- Test 3.1: Use the 'get_total_order' function ---
+-- Calculate the total for Order #1.
+SELECT get_total_order(1) AS CalculatedTotalForOrder1;
+-- Expected Result: 254.40
+
+
+-- --- Test 3.2: Use the 'compute_discount' function ---
+-- Calculate a sample 15% discount on a price of 300.00.
+SELECT compute_discount(300.00, 15) AS SampleDiscount;
+-- Expected Result: 255.00
+
+
+-- --- Test 3.3: Combine both functions ---
+-- Calculate the final price of Order #3 if it received a special 25% discount.
+SELECT compute_discount(get_total_order(3), 25) AS FinalPriceForOrder3WithDiscount;
+
+
+-- =================================================================================
+-- ## 4. TESTING TRIGGERS ##
+-- =================================================================================
+
+-- --- Test 4.1: Test the 'WarningFinishingStock' Trigger ---
+-- First, let's see the current stock of an item (Polo Shirt, id 10).
+SELECT stockQuantity FROM Product_Inventory WHERE idProductInventory = 10;
+
+-- Now, update its stock to a low number (e.g., 1).
+UPDATE Product_Inventory SET stockQuantity = 1 WHERE idProductInventory = 10;
+
+-- VERIFICATION: Your SQL client will show a WARNING: "Warning: Low Stock...".
+-- Check the final quantity to confirm the update was successful.
+SELECT stockQuantity FROM Product_Inventory WHERE idProductInventory = 10;
+
+
+-- --- Test 4.2: Test the 'PixDiscount' Trigger (using the corrected version) ---
+-- Let's create a new test order.
+INSERT INTO Orders (idCustomer, orderDate, status) VALUES (3, NOW(), 'Pending');
+SET @NewTestOrderID = LAST_INSERT_ID();
+
+-- Add a product to the order (Calça Social Feminina, price 150.00).
+INSERT INTO Orders_Items (idOrder, idProductInventory, quantity, unitPrice) VALUES (@NewTestOrderID, 11, 1, 150.00);
+
+-- ACTION: Pay for this 150.00 order with PIX. The trigger should automatically apply the 10% discount.
+INSERT INTO Payment (idOrder, idCustomer, paymentDate, transactionID, paymentMethod, status)
+VALUES (@NewTestOrderID, 3, NOW(), 'TRX_FINAL_DEMO', 'PIX', 'Completed');
+
+-- VERIFICATION: The 'amount' in the payment record should be 135.00, not 150.00!
+SELECT * FROM Payment WHERE idOrder = @NewTestOrderID;
+
+
+-- ===== END OF TEST SCRIPT =====
+
+
+
+
